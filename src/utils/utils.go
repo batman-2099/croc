@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -79,12 +80,23 @@ func Exists(name string) bool {
 	return true
 }
 
-// GetInput returns the input with a given prompt
-func GetInput(prompt string) string {
-	reader := bufio.NewReader(os.Stdin)
+// stdinReader is shared by all prompts so that piped or typed-ahead
+// answers buffered past one line survive to the next prompt.
+var stdinReader = bufio.NewReader(os.Stdin)
+
+// GetInput returns one line of input from stdin with a given prompt,
+// with surrounding whitespace trimmed. On read error (e.g. closed or
+// exhausted stdin) the returned string is empty, so callers that treat
+// an empty answer as consent must check the error.
+func GetInput(prompt string) (string, error) {
 	fmt.Fprintf(os.Stderr, "%s", prompt)
-	text, _ := reader.ReadString('\n')
-	return strings.TrimSpace(text)
+	text, err := stdinReader.ReadString('\n')
+	text = strings.TrimSpace(text)
+	if errors.Is(err, io.EOF) && text != "" {
+		// a final line without a trailing newline is still a valid answer
+		err = nil
+	}
+	return text, err
 }
 
 // HashFile returns the hash of a file or, in case of a symlink, the
@@ -418,11 +430,16 @@ func GetLocalIPs() (ips []string, err error) {
 		}
 		return
 	}
-	ips = []string{}
+	return localIPsFromAddrs(addrs), nil
+}
+
+func localIPsFromAddrs(addrs []net.Addr) (ips []string) {
 	for _, address := range addrs {
-		// check the address type and if it is not a loopback the display it
+		// Return every routable interface address. IPv6 link-local addresses are
+		// discovered through multicast instead because dialing them also requires
+		// the receiver's local interface zone.
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
+			if ipnet.IP.To4() != nil || (ipnet.IP.To16() != nil && !ipnet.IP.IsLinkLocalUnicast()) {
 				ips = append(ips, ipnet.IP.String())
 			}
 		}
@@ -503,6 +520,13 @@ func IsLocalIP(ipaddress string) bool {
 // any string in exclusions (case-insensitive) are also skipped, mirroring
 // the post-walk filter in cli.go for non-zip transfers.
 func ZipDirectory(destination string, source string, ignoredPaths map[string]bool, exclusions []string) (err error) {
+	return ZipDirectoryWithExactExclusions(destination, source, ignoredPaths, exclusions, nil)
+}
+
+// ZipDirectoryWithExactExclusions is ZipDirectory with support for exact
+// paths relative to source. Legacy exclusions remain case-insensitive
+// substring matches.
+func ZipDirectoryWithExactExclusions(destination string, source string, ignoredPaths map[string]bool, exclusions, exactExclusions []string) (err error) {
 	if _, err = os.Stat(destination); err == nil {
 		log.Errorf("%s file already exists!\n", destination)
 		return fmt.Errorf("file already exists: %s", destination)
@@ -613,6 +637,7 @@ func ZipDirectory(destination string, source string, ignoredPaths map[string]boo
 		// Create zip path with base name structure
 		zipPath := filepath.Join(baseName, relPath)
 		zipPath = filepath.ToSlash(zipPath)
+		relPath = NormalizeRelativePath(relPath)
 
 		// Honour --exclude: case-insensitive substring match against the zip
 		// path, mirroring the post-walk filter in cli.go.
@@ -620,6 +645,16 @@ func ZipDirectory(destination string, source string, ignoredPaths map[string]boo
 			zipPathLower := strings.ToLower(zipPath)
 			for _, exclusion := range exclusions {
 				if strings.Contains(zipPathLower, exclusion) {
+					if info.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
+		}
+		if len(exactExclusions) > 0 {
+			for _, exclusion := range exactExclusions {
+				if relPath == NormalizeRelativePath(exclusion) {
 					if info.IsDir() {
 						return filepath.SkipDir
 					}
@@ -693,6 +728,14 @@ func ZipDirectory(destination string, source string, ignoredPaths map[string]boo
 	return nil
 }
 
+// NormalizeRelativePath converts a path to a portable, clean relative-path
+// representation suitable for exact comparisons.
+func NormalizeRelativePath(p string) string {
+	p = filepath.ToSlash(filepath.Clean(p))
+	p = strings.TrimPrefix(p, "./")
+	return p
+}
+
 func pathWithin(parent string, child string) bool {
 	rel, err := filepath.Rel(filepath.Clean(parent), filepath.Clean(child))
 	if err != nil {
@@ -753,7 +796,8 @@ func UnzipDirectory(destination string, source string) error {
 		// check if file exists
 		if _, err := os.Stat(filePath); err == nil {
 			prompt := fmt.Sprintf("\nOverwrite '%s'? (y/N) ", filePath)
-			choice := strings.ToLower(GetInput(prompt))
+			choice, _ := GetInput(prompt)
+			choice = strings.ToLower(choice)
 			if choice != "y" && choice != "yes" {
 				fmt.Fprintf(os.Stderr, "Skipping '%s'\n", filePath)
 				continue

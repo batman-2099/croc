@@ -768,6 +768,59 @@ func TestGetFilesInfoZipFolderHonoursFilters(t *testing.T) {
 	}
 }
 
+func TestGetFilesInfoExactFileExclusion(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "root")
+	for _, rel := range []string{"a/image.jpg", "b/a/image.jpg", "photo.png"} {
+		file := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(file, []byte(rel), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+
+	files, _, _, err := GetFilesInfoWithExactExclusions([]string{root}, false, false, nil, []string{"a/image.jpg"})
+	if err != nil {
+		t.Fatalf("GetFilesInfoWithExactExclusions: %v", err)
+	}
+	got := make(map[string]bool)
+	for _, file := range files {
+		rel, err := filepath.Rel(root, filepath.Join(file.FolderSource, file.Name))
+		if err != nil {
+			t.Fatalf("relative path: %v", err)
+		}
+		got[filepath.ToSlash(rel)] = true
+	}
+	if got["a/image.jpg"] {
+		t.Fatal("exactly excluded file was returned")
+	}
+	for _, want := range []string{"b/a/image.jpg", "photo.png"} {
+		if !got[want] {
+			t.Errorf("expected %q to be returned; got %v", want, got)
+		}
+	}
+}
+
+// TestIsChild guards the gitignore walk helper. A directory or file whose
+// base name merely starts with ".." (e.g. "..cache") is still a legitimate
+// child of its parent and must be reported as such, otherwise it escapes the
+// inherited ignore rules in gitWalk and leaks into --git transfers.
+func TestIsChild(t *testing.T) {
+	sep := string(os.PathSeparator)
+	base := filepath.Join(sep+"a", "b")
+	// genuine descendants
+	assert.True(t, isChild(base, filepath.Join(base, "c")))
+	assert.True(t, isChild(base, filepath.Join(base, "c", "d")))
+	// a child whose name starts with ".." is still a child (regression)
+	assert.True(t, isChild(base, filepath.Join(base, "..cache")))
+	// the path itself is treated as a child
+	assert.True(t, isChild(base, base))
+	// siblings and ancestors are not children
+	assert.False(t, isChild(base, filepath.Join(sep+"a", "bc")))
+	assert.False(t, isChild(base, sep+"a"))
+}
+
 func TestGetFilesInfoZipFolderFromInsideSourceExcludesArchiveItself(t *testing.T) {
 	tmpDir := t.TempDir()
 	src := filepath.Join(tmpDir, "payload")
@@ -901,7 +954,7 @@ func TestCrocLocal(t *testing.T) {
 	wg.Wait()
 }
 
-func TestSenderWaitsForLocalRelayAfterExternalRelayCloses(t *testing.T) {
+func TestSenderAndReceiverPreferLocalRelayOverExternalRelay(t *testing.T) {
 	log.SetLevel("warn")
 	localIPs, err := utils.GetLocalIPs()
 	if err != nil || len(localIPs) == 0 {
@@ -965,10 +1018,6 @@ func TestSenderWaitsForLocalRelayAfterExternalRelayCloses(t *testing.T) {
 		errc <- sender.Send(filesInfo, emptyFolders, totalNumberFolders)
 	}()
 	go func() {
-		if err := waitHashed(sender); err != nil {
-			errc <- err
-			return
-		}
 		errc <- receiver.Receive()
 	}()
 
@@ -977,6 +1026,13 @@ func TestSenderWaitsForLocalRelayAfterExternalRelayCloses(t *testing.T) {
 			t.Fatalf("transfer failed: %v", err)
 		}
 	}
+
+	localControlAddress := net.JoinHostPort("127.0.0.1", sender.localRelayPort)
+	assert.Equal(t, localControlAddress, sender.currentRelayControlAddress())
+	_, receiverPort, err := net.SplitHostPort(receiver.currentRelayControlAddress())
+	assert.NoError(t, err)
+	assert.Equal(t, sender.localRelayPort, receiverPort)
+	assert.NotEqual(t, externalPorts[0], receiverPort)
 }
 
 func TestSenderLocalProbeDoesNotCorruptExternalRoute(t *testing.T) {
@@ -1496,25 +1552,23 @@ func TestReconnectFallsBackToRememberedRelay(t *testing.T) {
 	assert.Equal(t, relayAddress, receiver.Options.RelayAddress)
 }
 
-func TestSenderWaitsPastAlternateRouteTimeoutAfterTransferStarts(t *testing.T) {
+func TestSenderWaitsPastAlternateRouteTimeoutAfterRouteIsReady(t *testing.T) {
 	oldTimeout := alternateSenderRouteTimeout
-	oldPollInterval := alternateSenderRoutePollInterval
 	defer func() {
 		alternateSenderRouteTimeout = oldTimeout
-		alternateSenderRoutePollInterval = oldPollInterval
 	}()
 	alternateSenderRouteTimeout = 30 * time.Millisecond
-	alternateSenderRoutePollInterval = 5 * time.Millisecond
 
 	c := &Client{
-		stop: newStop(context.Background()),
+		stop:             newStop(context.Background()),
+		senderRouteReady: make(chan struct{}),
 	}
 	errchan := make(chan error, 1)
 	originalErr := fmt.Errorf("losing route EOF")
 
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		c.firstSend = true
+		c.markSenderRouteReady()
 		time.Sleep(60 * time.Millisecond)
 		errchan <- nil
 	}()

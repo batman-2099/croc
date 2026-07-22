@@ -13,11 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chzyer/readline"
 	"github.com/schollz/cli/v2"
 	"github.com/schollz/croc/v10/src/comm"
 	"github.com/schollz/croc/v10/src/croc"
-	"github.com/schollz/croc/v10/src/mnemonicode"
 	"github.com/schollz/croc/v10/src/models"
 	"github.com/schollz/croc/v10/src/tcp"
 	"github.com/schollz/croc/v10/src/utils"
@@ -36,7 +34,7 @@ func Run() (err error) {
 	app := cli.NewApp()
 	app.Name = "croc"
 	if Version == "" {
-		Version = "v10.4.14"
+		Version = "v10.5.0"
 	}
 	app.Version = Version
 	app.Compiled = time.Now()
@@ -79,6 +77,7 @@ func Run() (err error) {
 				&cli.IntFlag{Name: "transfers", Value: 4, Usage: "number of ports to use for transfers"},
 				&cli.BoolFlag{Name: "qrcode", Aliases: []string{"qr"}, Usage: "show receive code as a qrcode"},
 				&cli.StringFlag{Name: "exclude", Value: "", Usage: "exclude files if they contain any of the comma separated strings"},
+				&cli.StringFlag{Name: "exclude-file", Value: "", Usage: "exclude files matching any of the comma separated relative paths exactly"},
 				&cli.StringFlag{Name: "socks5", Value: "", Usage: "add a socks5 proxy", EnvVars: []string{"SOCKS5_PROXY"}},
 				&cli.StringFlag{Name: "connect", Value: "", Usage: "add a http proxy", EnvVars: []string{"HTTP_PROXY"}},
 			},
@@ -167,7 +166,8 @@ access the shared secret and receive the files instead of the intended
 recipient.
 
 Do you wish to continue to DISABLE the classic mode? (y/N) `)
-				choice := strings.ToLower(utils.GetInput(""))
+				choice, _ := utils.GetInput("")
+				choice = strings.ToLower(choice)
 				if choice == "y" || choice == "yes" {
 					os.Remove(classicFile)
 					fmt.Print("\nClassic mode DISABLED.\n\n")
@@ -191,7 +191,8 @@ multi-user system, this could allow other local users to access the
 shared secret and receive the files instead of the intended recipient.
 
 Do you wish to continue to enable the classic mode? (y/N) `)
-				choice := strings.ToLower(utils.GetInput(""))
+				choice, _ := utils.GetInput("")
+				choice = strings.ToLower(choice)
 				if choice == "y" || choice == "yes" {
 					fmt.Print("\nClassic mode ENABLED.\n\n")
 					os.WriteFile(classicFile, []byte("enabled"), 0o644)
@@ -215,7 +216,11 @@ Do you wish to continue to enable the classic mode? (y/N) `)
 				fnames = append(fnames, "'"+basename+"'")
 			}
 			promptMessage := fmt.Sprintf("Did you mean to send %s? (Y/n) ", strings.Join(fnames, ", "))
-			choice := strings.ToLower(utils.GetInput(promptMessage))
+			choice, errInput := utils.GetInput(promptMessage)
+			if errInput != nil {
+				return fmt.Errorf("could not read confirmation (use 'croc send' to send without one): %w", errInput)
+			}
+			choice = strings.ToLower(choice)
 			if choice == "" || choice == "y" || choice == "yes" {
 				return send(c)
 			}
@@ -327,6 +332,13 @@ func send(c *cli.Context) (err error) {
 			excludeStrings = append(excludeStrings, v)
 		}
 	}
+	excludeFiles := []string{}
+	for _, v := range strings.Split(c.String("exclude-file"), ",") {
+		v = utils.NormalizeRelativePath(strings.TrimSpace(v))
+		if v != "" && v != "." {
+			excludeFiles = append(excludeFiles, v)
+		}
+	}
 
 	ports := make([]string, transfersParam+1)
 	for i := 0; i <= transfersParam; i++ {
@@ -359,6 +371,7 @@ func send(c *cli.Context) (err error) {
 		ShowQrCode:        c.Bool("qrcode"),
 		MulticastAddress:  c.String("multicast"),
 		Exclude:           excludeStrings,
+		ExcludeFile:       excludeFiles,
 		Quiet:             c.Bool("quiet"),
 		DisableClipboard:  c.Bool("disable-clipboard"),
 		ExtendedClipboard: c.Bool("extended-clipboard"),
@@ -475,7 +488,7 @@ Or you can go back to the classic croc behavior by enabling classic mode:
 		// generate code phrase
 		crocOptions.SharedSecret = utils.GetRandomName()
 	}
-	minimalFileInfos, emptyFoldersToTransfer, totalNumberFolders, err := croc.GetFilesInfo(fnames, crocOptions.ZipFolder, crocOptions.GitIgnore, crocOptions.Exclude)
+	minimalFileInfos, emptyFoldersToTransfer, totalNumberFolders, err := croc.GetFilesInfoWithExactExclusions(fnames, crocOptions.ZipFolder, crocOptions.GitIgnore, crocOptions.Exclude, crocOptions.ExcludeFile)
 	if err != nil {
 		return
 	}
@@ -599,36 +612,6 @@ func saveConfig(c *cli.Context, crocOptions croc.Options) {
 	}
 }
 
-type TabComplete struct{}
-
-func (t TabComplete) Do(line []rune, pos int) ([][]rune, int) {
-	var words = strings.SplitAfter(string(line), "-")
-	var lastPartialWord = words[len(words)-1]
-	var nbCharacter = len(lastPartialWord)
-	if nbCharacter == 0 {
-		// No completion
-		return [][]rune{[]rune("")}, 0
-	}
-	if len(words) == 1 && nbCharacter == utils.NbPinNumbers {
-		// Check if word is indeed a number
-		_, err := strconv.Atoi(lastPartialWord)
-		if err == nil {
-			return [][]rune{[]rune("-")}, nbCharacter
-		}
-	}
-	var strArray [][]rune
-	for _, s := range mnemonicode.WordList {
-		if strings.HasPrefix(s, lastPartialWord) {
-			var completionCandidate = s[nbCharacter:]
-			if len(words) <= mnemonicode.WordsRequired(utils.NbBytesWords) {
-				completionCandidate += "-"
-			}
-			strArray = append(strArray, []rune(completionCandidate))
-		}
-	}
-	return strArray, nbCharacter
-}
-
 func receive(c *cli.Context) (err error) {
 	comm.Socks5Proxy = c.String("socks5")
 	comm.HttpProxy = c.String("connect")
@@ -743,16 +726,9 @@ Or you can go back to the classic croc behavior by enabling classic mode:
 		}
 	}
 	if crocOptions.SharedSecret == "" {
-		l, err := readline.NewEx(&readline.Config{
-			Prompt:       "Enter receive code: ",
-			AutoComplete: TabComplete{},
-		})
+		crocOptions.SharedSecret, err = utils.GetInput("Enter receive code: ")
 		if err != nil {
-			return err
-		}
-		crocOptions.SharedSecret, err = l.Readline()
-		if err != nil {
-			return err
+			return fmt.Errorf("could not read receive code: %w", err)
 		}
 	}
 	if c.String("out") != "" {
